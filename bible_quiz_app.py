@@ -1,40 +1,35 @@
-import streamlit as st
-import fitz                                # PyMuPDF
-import re, random, pandas as pd
+import streamlit as st, fitz, re, random, pandas as pd, glob, os
 
-# ────────────────────────── Helper: universal rerun ──────────────────────────
-def _do_rerun():
-    """Call st.rerun() on all Streamlit versions."""
-    if hasattr(st, "rerun"):                      # Streamlit ≥ 1.26
+# ─────────── universal rerun helper ───────────
+def _rerun():
+    if hasattr(st, "rerun"):
         st.rerun()
-    elif hasattr(st, "experimental_rerun"):       # Older versions
+    elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
 
-# ────────── Universal singleton decorator (works on any Streamlit) ───────────
-if hasattr(st, "singleton"):                      # Streamlit ≥ 1.18
+# ─────────── universal singleton decorator ────
+if hasattr(st, "singleton"):
     singleton = st.singleton
-elif hasattr(st, "experimental_singleton"):       # Older versions
+elif hasattr(st, "experimental_singleton"):
     singleton = st.experimental_singleton
-else:                                             # Very new versions
+else:
     singleton = st.cache_resource
 
 @singleton
 def leaderboard():
-    """Shared dict {player: {'correct': int, 'attempted': int}}."""
-    return {}
+    return {}    # {quiz_id: {player: {'correct':int,'attempted':int}}}
 
-def update_score(player: str, correct: bool):
-    board = leaderboard()
-    if player not in board:
-        board[player] = {'correct': 0, 'attempted': 0}
-    board[player]['attempted'] += 1
+def update_score(quiz_id, player, correct):
+    board = leaderboard().setdefault(quiz_id, {})
+    stats = board.setdefault(player, {'correct': 0, 'attempted': 0})
+    stats['attempted'] += 1
     if correct:
-        board[player]['correct'] += 1
+        stats['correct'] += 1
 
-# ──────────────────────── PDF parser (unchanged) ─────────────────────────────
+# ─────────────────── PDF → questions ──────────────────
 @st.cache_data
-def load_questions(pdf_path: str):
-    doc = fitz.open(pdf_path)
+def parse_pdf(path: str):
+    doc = fitz.open(path)
     raw = [ln.rstrip() for pg in doc for ln in pg.get_text().splitlines()]
 
     qs, i = [], 0
@@ -43,13 +38,11 @@ def load_questions(pdf_path: str):
         if not m_q:
             i += 1
             continue
-
         q_parts, i = [m_q.group(2)], i + 1
         while i < len(raw) and not re.match(r"^A\.\s*$", raw[i].strip()):
             if raw[i].strip() and not re.match(r"^\d+\s*$", raw[i].strip()):
                 q_parts.append(raw[i].strip())
             i += 1
-
         choices, correct_letter = {}, None
         for opt in "ABCD":
             if i < len(raw) and re.match(fr"^{opt}\.\s*$", raw[i].strip()):
@@ -57,17 +50,15 @@ def load_questions(pdf_path: str):
                 c_parts = []
                 while (i < len(raw)
                        and not re.match(r"^[A-D]\.\s*$", raw[i].strip())
-                       and not re.match(r"^[A-D]:[BIA]:Lk:", raw[i].strip())):
+                       and not re.match(r"^[A-D]:[BIA]:\w\w:", raw[i].strip())):
                     if raw[i].strip():
                         c_parts.append(raw[i].strip())
                     i += 1
                 choices[opt] = f"{opt}. {' '.join(c_parts)}"
-
         if i < len(raw):
-            m_ans = re.match(r"^([A-D]):[BIA]:Lk:", raw[i].strip())
+            m_ans = re.match(r"^([A-D]):[BIA]:\w\w:", raw[i].strip())
             if m_ans:
                 correct_letter, i = m_ans.group(1), i + 1
-
         if correct_letter and len(choices) == 4:
             qs.append(
                 dict(
@@ -76,88 +67,103 @@ def load_questions(pdf_path: str):
                     correct=choices[correct_letter],
                 )
             )
+    random.shuffle(qs)
     return qs
 
-# ──────────────────────────── Streamlit UI ───────────────────────────────────
-st.set_page_config("Luke Quiz", "📖", layout="centered")
-st.title("📖 Luke Multiple‑Choice Bible Quiz")
+# ──────────────── load every *_MC_Questions.pdf ────────────────
+@st.cache_data
+def load_all_quizzes():
+    quizzes = {}
+    for path in glob.glob("*_MC_Questions.pdf"):
+        book = re.search(r"_([A-Za-z]+)_MC_Questions\.pdf", path).group(1).title()
+        quizzes[book] = parse_pdf(path)
+    # combined “All Books” list
+    if len(quizzes) >= 2:
+        all_qs = sum(quizzes.values(), [])  # concatenate lists
+        random.shuffle(all_qs)
+        quizzes["All Books"] = all_qs
+    return quizzes
 
-QUESTIONS = load_questions("03_Luke_MC_Questions.pdf")
-if not QUESTIONS:
-    st.error("Could not parse questions — check PDF location.")
+QUIZZES = load_all_quizzes()
+if not QUIZZES:
+    st.error("No *_MC_Questions.pdf files in folder.")
     st.stop()
 
-# 1️⃣  Ask for player name (main page)
-if "player_name" not in st.session_state:
+# ─────────────── Streamlit UI ─────────────────────────
+st.set_page_config("Bible Quiz", "📖", layout="centered")
+st.title("📖 Bible Multiple‑Choice Quiz")
+
+# Book selector
+if "book" not in st.session_state:
+    st.session_state.book = list(QUIZZES.keys())[0]
+
+st.session_state.book = st.selectbox(
+    "Choose a quiz set:", list(QUIZZES.keys()),
+    index=list(QUIZZES.keys()).index(st.session_state.book)
+)
+quiz_id = st.session_state.book
+QUESTIONS = QUIZZES[quiz_id]
+
+# Name prompt
+if "player" not in st.session_state:
     st.subheader("Enter your name to start")
     name = st.text_input("Name")
     if st.button("Start ▶️") and name.strip():
-        st.session_state.player_name = name.strip()
-        _do_rerun()
+        st.session_state.player = name.strip()
+        st.session_state.idx = 0
+        st.session_state.correct = 0
+        _rerun()
     st.stop()
 
-player = st.session_state.player_name
+player = st.session_state.player
 
-# 2️⃣  Initialize per‑session quiz state
-if "q_idx" not in st.session_state:
-    st.session_state.q_idx = random.randrange(len(QUESTIONS))
-if "answered" not in st.session_state:
-    st.session_state.answered = False
-if "selection" not in st.session_state:
-    st.session_state.selection = None
+# Reset progress if player switches quiz
+if "current_quiz" not in st.session_state or st.session_state.current_quiz != quiz_id:
+    st.session_state.current_quiz = quiz_id
+    st.session_state.idx = 0
+    st.session_state.correct = 0
 
-def new_question():
-    st.session_state.q_idx = random.randrange(len(QUESTIONS))
-    st.session_state.answered = False
-    st.session_state.selection = None
+idx = st.session_state.idx
 
-q = QUESTIONS[st.session_state.q_idx]
+# Personal score line
+attempts = idx
+correct = st.session_state.correct
+pct = f"{correct/attempts*100:.1f}%" if attempts else "‑"
+st.markdown(f"**{player} — {quiz_id} score:** {correct}/{attempts}  |  **Accuracy:** {pct}")
 
-# 3️⃣  Show personal running score
-stats = leaderboard().get(player, {'correct': 0, 'attempted': 0})
-attempts, corr = stats['attempted'], stats['correct']
-percent = f"{corr/attempts*100:.1f}%" if attempts else "‑"
-st.markdown(f"**{player} — Score:** {corr}/{attempts} &nbsp;&nbsp;|&nbsp;&nbsp; **Accuracy:** {percent}")
+# Show question / flow
+if idx < len(QUESTIONS):
+    q = QUESTIONS[idx]
+    st.subheader(f"Question {idx+1} / {len(QUESTIONS)}")
+    choice = st.radio(q["question"], q["choices"], index=None, key=idx)
+    if st.button("Submit", key=f"sub{idx}") and choice:
+        is_correct = choice == q["correct"]
+        if is_correct:
+            st.success("✅ Correct!")
+            st.session_state.correct += 1
+        else:
+            st.error("❌ Incorrect.")
+            st.info(f"**Correct answer:** {q['correct']}")
+        update_score(quiz_id, player, is_correct)
+        st.session_state.idx += 1
+        _rerun()
+else:
+    st.balloons()
+    st.success(f"Finished {quiz_id}! Final: {correct}/{attempts} ({pct})")
+    if st.button("Restart this quiz"):
+        st.session_state.idx = 0
+        st.session_state.correct = 0
+        _rerun()
 
-# 4️⃣  Display question and choices
-st.subheader("Question")
-st.write(q["question"])
-
-st.session_state.selection = st.radio(
-    "Choose your answer:",
-    q["choices"],
-    index=(
-        q["choices"].index(st.session_state.selection)
-        if st.session_state.selection in q["choices"] else 0
-    ),
-    disabled=st.session_state.answered,
-)
-
-# 5️⃣  Submit button
-if st.button("Submit", disabled=st.session_state.answered):
-    is_correct = st.session_state.selection == q["correct"]
-    if is_correct:
-        st.success("✅ Correct!")
-    else:
-        st.error("❌ Incorrect.")
-        st.info(f"**Correct answer:** {q['correct']}")
-    update_score(player, is_correct)
-    st.session_state.answered = True
-    _do_rerun()
-
-# 6️⃣  Next Question button
-if st.session_state.answered:
-    st.button("Next Question ▶️", on_click=new_question)
-
-# 7️⃣  Leaderboard in sidebar
+# Leaderboard
 st.sidebar.header("🏆 Leaderboard")
-if leaderboard():
-    df = (
-        pd.DataFrame(leaderboard())
-        .T.rename(columns={'correct': 'Correct', 'attempted': 'Attempts'})
-        .assign(Percent=lambda d: (d['Correct'] / d['Attempts'] * 100).round(1))
-        .sort_values(['Percent', 'Attempts'], ascending=[False, False])
-    )
+lb = leaderboard().get(quiz_id, {})
+if lb:
+    df = (pd.DataFrame(lb)
+          .T.rename(columns={'correct':'Correct','attempted':'Attempts'})
+          .assign(Percent=lambda d:(d['Correct']/d['Attempts']*100).round(1))
+          .sort_values(['Percent','Attempts'], ascending=[False, False]))
+    st.sidebar.markdown(f"### {quiz_id}")
     st.sidebar.dataframe(df, use_container_width=True)
 else:
-    st.sidebar.write("No scores yet — be the first!")
+    st.sidebar.write("No scores yet for this quiz.")
